@@ -1,27 +1,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { searchPlacesText } from "@/lib/places";
 const input = z
   .object({
     name: z.string().trim().min(1).max(120),
     city: z.string().trim().min(1).max(120),
   })
   .strict();
-const candidate = z.object({
-  id: z.string(),
-  displayName: z.object({ text: z.string() }).optional(),
-  formattedAddress: z.string().optional(),
-  location: z
-    .object({ latitude: z.number(), longitude: z.number() })
-    .optional(),
-  attributions: z
-    .array(
-      z.object({
-        provider: z.string().optional(),
-        providerUri: z.string().optional(),
-      }),
-    )
-    .optional(),
-});
 export async function POST(request: Request) {
   if (Number(request.headers.get("content-length") || 0) > 4096)
     return NextResponse.json(
@@ -48,8 +33,8 @@ export async function POST(request: Request) {
       { error: "Name and city are required (up to 120 characters each)." },
       { status: 400 },
     );
-  const key = process.env.GOOGLE_PLACES_API_KEY;
-  if (!key)
+  const result = await searchPlacesText(`${data.data.name}, ${data.data.city}`);
+  if (!result.configured)
     return NextResponse.json(
       {
         error:
@@ -58,47 +43,18 @@ export async function POST(request: Request) {
       },
       { status: 503 },
     );
-  try {
-    const response = await fetch(
-      "https://places.googleapis.com/v1/places:searchText",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": key,
-          "X-Goog-FieldMask":
-            "places.id,places.displayName,places.formattedAddress,places.location,places.attributions",
-        },
-        body: JSON.stringify({
-          textQuery: `${data.data.name}, ${data.data.city}`,
-          pageSize: 3,
-        }),
-        signal: AbortSignal.timeout(8000),
-        cache: "no-store",
-      },
-    );
-    if (!response.ok)
-      return NextResponse.json(
-        {
-          error:
-            "Google Places could not complete the search. Save without a match and try again later.",
-        },
-        { status: 502 },
-      );
-    const output = z
-      .object({ places: z.array(candidate).max(3).optional() })
-      .parse(await response.json());
-    return NextResponse.json(
-      { candidates: output.places || [], configured: true },
-      { headers: { "Cache-Control": "no-store" } },
-    );
-  } catch {
+  if (result.error)
     return NextResponse.json(
       {
         error:
-          "Google Places timed out or returned an invalid response. You can keep using saved places.",
+          result.error === "provider"
+            ? "Google Places could not complete the search. Save without a match and try again later."
+            : "Google Places timed out or returned an invalid response. You can keep using saved places.",
       },
       { status: 502 },
     );
-  }
+  return NextResponse.json(
+    { candidates: result.candidates, configured: true },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }

@@ -4,7 +4,7 @@ import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { emptyState, stateSchema, SavedPlace } from "../lib/model";
 import { intentSchema, actionSchema, applyLiveResult, ModelAction, zonedTime } from "../lib/live";
-import { runAgent, validateAction, retrievalSources, AgentInput, verifiedPlace, signedPlace } from "../lib/agent";
+import { runAgent, validateAction, retrievalSources, AgentInput, verifiedPlace, signedPlace, explicitLocation } from "../lib/agent";
 import { POST } from "../app/api/recommend/route";
 const key = "unit-test-not-a-real-key";
 const base = (): ModelAction => ({ reply: "Here are grounded suggestions. Quietness is unknown.", kind: "recommend", options: [], stops: [], discovered: [], sourceIds: [], settings: null, schedule: null, outingDate: null, save: null, visit: null, preference: null, event: null, eventChoice: "keep" });
@@ -49,11 +49,15 @@ test("official SDK mocked research flow retains retrieval URLs, context and cand
   assert.equal(state.messages.at(-1)?.text.includes("No extra coffee"), true);
 });
 
-test("unknown candidate/citation IDs and unsourced invented places are rejected atomically", () => {
+test("unknown candidate IDs stay rejected while sparse citations fall back to Maps links", () => {
   const request = input();
   assert.throws(() => validateAction({ ...base(), options: [{ id: "invented", reason: "Wrong" }] }, request, [], key), /Unknown candidate/);
-  assert.throws(() => validateAction({ ...base(), sourceIds: [99] }, request, [source], key), /citation/);
-  assert.throws(() => validateAction({ ...base(), discovered: [{ ...discovered("new", "Wrong"), sourceIds: [] }] }, request, [], key), /retrieved source/);
+  const skipped = validateAction({ ...base(), sourceIds: [99] }, request, [source], key);
+  assert.equal(skipped.citations.length, 0);
+  const unsourced = validateAction({ ...base(), options: [{ id: "new", reason: "Unverified neighborhood match." }], discovered: [{ ...discovered("new", "Caffe Trieste"), sourceIds: [] }] }, request, [], key);
+  assert.equal(unsourced.candidates.length, 1);
+  assert.match(unsourced.candidates[0].web!.citations[0].url, /google\.com\/maps/);
+  assert.match(unsourced.candidates[0].web!.uncertainty, /unknown|unverified/i);
   assert.throws(() => validateAction({ ...base(), reply: "https://invented.example" }, request, [], key), /generated URLs/);
   assert.deepEqual(retrievalSources([{ type: "message", content: [{ type: "output_text", text: "https://invented.example", annotations: [] }] }]), []);
   assert.deepEqual(request.state, emptyState());
@@ -186,26 +190,37 @@ test("malformed Responses output is reported separately from provider errors", a
   }
 });
 
-test("empty web-search citations return a transparent no-source response instead of failing", async () => {
+test("empty web-search citations fall back to unverified suggestions instead of failing", async () => {
   const original = process.env.OPENAI_API_KEY;
   const originalFetch = globalThis.fetch;
   const originalConsoleError = console.error;
   const logs: string[] = [];
   process.env.OPENAI_API_KEY = key;
-  let calls = 0;
+  let openaiCalls = 0;
   console.error = (line?: unknown) => logs.push(String(line));
-  globalThis.fetch = async () => response(++calls === 1
-    ? { research: true, researchQuery: "Find local primary sources.", locationNeeded: false, question: null }
-    : "No search result was returned.");
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("places.googleapis.com")) return Response.json({ places: [] });
+    openaiCalls++;
+    if (openaiCalls === 1) return response({ research: true, researchQuery: "Find local primary sources.", locationNeeded: false, question: null });
+    if (openaiCalls === 2) return response("No search result was returned.");
+    return response({
+      ...base(),
+      reply: "Unverified coffee suggestions near you. Hours and atmosphere are unknown.",
+      options: [{ id: "cafe-a", reason: "Well-known area cafe; treat as unverified." }],
+      discovered: [discovered("cafe-a", "Caffe Trieste")],
+      sourceIds: [],
+    });
+  };
   try {
     const result = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.23" }, body: JSON.stringify(input()) }));
     const body = await result.json();
     assert.equal(result.status, 200);
     assert.equal(body.researched, true);
-    assert.equal(body.candidates.length, 0);
-    assert.match(body.reply, /couldn’t verify current local sources/i);
+    assert.equal(body.candidates.length, 1);
+    assert.match(body.reply, /unverified/i);
+    assert.match(body.candidates[0].web.citations[0].url, /google\.com\/maps/);
     assert.deepEqual(logs, []);
-    assert.equal(calls, 2);
+    assert.equal(openaiCalls, 3);
   } finally {
     console.error = originalConsoleError;
     globalThis.fetch = originalFetch;
@@ -216,6 +231,8 @@ test("empty web-search citations return a transparent no-source response instead
 test("a typed neighborhood answer is retained and satisfies a location follow-up", async () => {
   const request = input();
   request.text = "north beach";
+  request.location = null;
+  request.state.settings.location = "";
   request.state.messages = [{ id: "ask", role: "assistant", text: "Which city or neighborhood should I look in?", kind: "text" }];
   const bodies: Record<string, unknown>[] = [];
   const client = new OpenAI({ apiKey: key, maxRetries: 0, fetch: async (_url, init) => {
@@ -229,6 +246,82 @@ test("a typed neighborhood answer is retained and satisfies a location follow-up
   assert.equal(bodies.length, 2);
   assert.match(JSON.stringify(bodies[0].input), /north beach/i);
   assert.equal(result.settings?.location, "north beach");
+});
+
+test("neighborhood phrases and GPS persist without re-asking for a city", async () => {
+  assert.equal(explicitLocation({ ...input(), text: "north beach", location: null, state: emptyState() }), "north beach");
+  assert.equal(explicitLocation({ ...input(), text: "sf north beach", location: null, state: emptyState() }), "sf north beach");
+  assert.equal(explicitLocation({ ...input(), text: "Find coffee shops in North Beach", location: null, state: emptyState() }), "North Beach");
+  assert.equal(explicitLocation({ ...input(), text: "find a coffee shop", location: null, state: emptyState() }), "");
+  const request = input();
+  request.text = "sf north beach";
+  request.location = null;
+  request.state.settings.location = "";
+  const bodies: Record<string, unknown>[] = [];
+  const client = new OpenAI({ apiKey: key, maxRetries: 0, fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    bodies.push(body);
+    return response(bodies.length === 1
+      ? { research: false, researchQuery: "", locationNeeded: true, question: "Which city or neighborhood should I look in?" }
+      : base());
+  } });
+  const named = await runAgent(request, key, AbortSignal.timeout(5000), client);
+  assert.equal(bodies.length, 2);
+  assert.equal(named.settings?.location, "sf north beach");
+  const gpsRequest = input();
+  gpsRequest.text = "find a coffee shop";
+  gpsRequest.state.settings.location = "";
+  gpsRequest.location = { latitude: 37.8, longitude: -122.41, accuracy: 100 };
+  const gpsBodies: Record<string, unknown>[] = [];
+  const gpsClient = new OpenAI({ apiKey: key, maxRetries: 0, fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    gpsBodies.push(body);
+    return response(gpsBodies.length === 1
+      ? { research: false, researchQuery: "", locationNeeded: true, question: "What city or neighborhood are you in?" }
+      : base());
+  } });
+  const gps = await runAgent(gpsRequest, key, AbortSignal.timeout(5000), gpsClient);
+  assert.equal(gpsBodies.length, 2);
+  assert.equal(gps.settings?.location, "Current location");
+});
+
+test("empty web search can use Google Places hits as structured fallback sources", async () => {
+  const originalKey = process.env.GOOGLE_PLACES_API_KEY;
+  const originalFetch = globalThis.fetch;
+  process.env.GOOGLE_PLACES_API_KEY = "test-only-fake-key";
+  const request = input();
+  request.text = "coffee shops in North Beach";
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://places.googleapis.com/v1/places:searchText");
+    return Response.json({
+      places: [{ id: "ChIJcafe", displayName: { text: "Caffe Trieste" }, formattedAddress: "601 Vallejo St, San Francisco" }],
+    });
+  };
+  const bodies: Record<string, unknown>[] = [];
+  const client = new OpenAI({ apiKey: key, maxRetries: 0, fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    bodies.push(body);
+    if (bodies.length === 1) return response({ research: true, researchQuery: "coffee shops North Beach", locationNeeded: false, question: null });
+    if (bodies.length === 2) return response("No search result was returned.");
+    return response({
+      ...base(),
+      reply: "Caffe Trieste is a Maps lookup match; hours and atmosphere are unverified.",
+      options: [{ id: "cafe-a", reason: "Matches North Beach coffee." }],
+      discovered: [{ ...discovered("cafe-a", "Caffe Trieste"), address: "601 Vallejo St, San Francisco", sourceIds: [0] }],
+      sourceIds: [0],
+    });
+  } });
+  try {
+    const result = await runAgent(request, key, AbortSignal.timeout(5000), client);
+    assert.equal(bodies.length, 3);
+    assert.equal(result.candidates[0].name, "Caffe Trieste");
+    assert.match(result.candidates[0].web!.citations[0].url, /google\.com\/maps/);
+    assert.match(String(bodies[2].input), /Google Places lookup/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey) process.env.GOOGLE_PLACES_API_KEY = originalKey;
+    else delete process.env.GOOGLE_PLACES_API_KEY;
+  }
 });
 
 test("action validation failures are reported separately from malformed model output", async () => {

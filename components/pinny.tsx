@@ -275,8 +275,7 @@ export default function Pinny() {
           return score(b)-score(a);
         });
         const bounded = { ...snapshot, places: ranked.slice(0, 40).map((p) => ({ ...p, whySaved: p.whySaved.slice(0,600) })), visits: snapshot.visits.slice(-40).map((v) => ({ ...v, note: v.note.slice(0,600) })), messages: snapshot.messages.slice(-16).map((m) => ({ ...m, text: m.text.slice(0,1200) })) };
-        const locationNeeded = /nearby|closer|near me|here|around me|walking distance/i.test(text);
-        const response = await fetch("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, state: bounded, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, location: locationNeeded ? currentLocation : null }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(58000)]) });
+        const response = await fetch("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, state: bounded, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, location: currentLocation }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(58000)]) });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Live research failed. Your data was kept.");
         if (latest.current.state !== snapshot || latest.current.mode !== "live" || conflict.current) throw new Error("Your workspace changed during this request. Retry using the current data.");
@@ -534,8 +533,14 @@ export default function Pinny() {
       (position) => {
         setOrigin(`${position.coords.latitude},${position.coords.longitude}`);
         setCurrentLocation({ latitude: Math.round(position.coords.latitude * 1000)/1000, longitude: Math.round(position.coords.longitude * 1000)/1000, accuracy: Math.max(100, position.coords.accuracy) });
+        const snapshot = latest.current.state;
+        if (!snapshot.settings.location) {
+          const next = structuredClone(snapshot);
+          next.settings.location = "Current location";
+          commit(next);
+        }
         setLocationStatus(
-          "Current area is active for this tab. Nearby/closer requests share an approximate position with live AI. Precise coordinates are not saved. You can use a typed city instead.",
+          "Current area is active for this tab and saved as your session location. Live AI can reuse it for later requests. Precise coordinates are not stored. You can type a city instead.",
         );
       },
       (error) => {
@@ -1026,7 +1031,7 @@ export default function Pinny() {
               {state.settings.availableTime} min of activities
             </button>
           </div>
-          <div className="location-actions"><button type="button" className="quiet" onClick={locate} disabled={processing || locationStatus === "Requesting location…"}><MapPin size={14} /> Use my location</button>{currentLocation && <button className="quiet" onClick={() => { setCurrentLocation(null); setOrigin(""); setLocationStatus("Current location cleared. Type a city or neighborhood."); }}>Clear current area</button>}</div>
+          <div className="location-actions"><button type="button" className="quiet" onClick={locate} disabled={processing || locationStatus === "Requesting location…"}><MapPin size={14} /> Use my location</button>{currentLocation && <button className="quiet" onClick={() => { setCurrentLocation(null); setOrigin(""); const next = structuredClone(state); if (next.settings.location === "Current location") { next.settings.location = ""; commit(next); } setLocationStatus("Current location cleared. Type a city or neighborhood."); }}>Clear current area</button>}</div>
           {locationStatus && <p className="location-status" role="status">{locationStatus}</p>}
           {liveError && <div className="live-error" role="alert"><p>{liveError}</p><button className="quiet" onClick={() => submit(input)}>Retry live</button><button className="quiet" onClick={() => { setPersonalEngine("saved"); try { localStorage.setItem("pinny:engine","saved"); } catch {} setLiveError(""); }}>Use saved-only mode</button><button className="quiet" onClick={switchMode}>Switch to sample demo</button></div>}
           <form
@@ -1345,7 +1350,7 @@ export default function Pinny() {
               </p>
             )}
             <p className="fine-print">
-              Precise location stays in tab memory for Maps. Nearby/closer live requests send an approximate position to the server and OpenAI. Type a city/neighborhood instead at any time.
+              Precise location stays in tab memory for Maps. When active, live requests share an approximate position with the server and OpenAI. Type a city/neighborhood instead at any time.
             </p>
             {mode === "live" && (
               <div className="data-transfer">
