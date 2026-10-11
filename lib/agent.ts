@@ -7,6 +7,46 @@ import { actionSchema, intentSchema, ModelAction, LiveResult, liveResultSchema, 
 import { newId } from "./conversation";
 
 export const DEFAULT_MODEL = "gpt-5.4-mini";
+export type AgentFailureCategory = "provider_api_error" | "malformed_model_output" | "web_search_failed" | "action_validation_failed" | "internal_agent_error";
+export class AgentFailure extends Error {
+  constructor(readonly stage: string, readonly category: AgentFailureCategory, readonly safeCode: string, readonly safeErrorClass = "Error") {
+    super(safeCode);
+    this.name = "AgentFailure";
+  }
+}
+export function isAgentFailure(error: unknown): error is AgentFailure {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as Partial<AgentFailure>;
+  return candidate.name === "AgentFailure" && typeof candidate.stage === "string" &&
+    ["provider_api_error", "malformed_model_output", "web_search_failed", "action_validation_failed", "internal_agent_error"].includes(candidate.category || "") &&
+    typeof candidate.safeCode === "string" && typeof candidate.safeErrorClass === "string";
+}
+type StageReporter = (stage: string) => void;
+async function providerCall<T>(stage: string, report: StageReporter, call: () => Promise<T>, parsingResponse = false): Promise<T> {
+  report(stage);
+  try {
+    const result = await call();
+    report("provider_response");
+    return result;
+  } catch (error) {
+    if (error instanceof OpenAI.APIError) {
+      const code = error instanceof OpenAI.APIConnectionTimeoutError ? "provider_timeout" :
+        Number.isInteger(error.status) ? `provider_http_${error.status}` : "provider_connection_error";
+      throw new AgentFailure(stage, "provider_api_error", code, "OpenAI.APIError");
+    }
+    if (parsingResponse) {
+      const parseClass = error instanceof Error && ["LengthFinishReasonError", "ContentFilterFinishReasonError", "SyntaxError"].includes(error.name) ? error.name : "ResponseParseError";
+      throw new AgentFailure("parse", "malformed_model_output", `${stage}_response_parse_failed`, parseClass);
+    }
+    throw new AgentFailure(stage, "provider_api_error", "provider_transport_error", error instanceof Error ? "Error" : "UnknownError");
+  }
+}
+function parseModelOutput<T>(schema: z.ZodType<T>, value: unknown, report: StageReporter, label: string): T {
+  report("parse");
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) throw new AgentFailure("parse", "malformed_model_output", `${label}_schema_mismatch`, "ZodError");
+  return parsed.data;
+}
 export const agentInputSchema = z.object({
   text: z.string().trim().min(1).max(2000),
   state: stateSchema,
@@ -109,7 +149,7 @@ export function validateAction(action: ModelAction, input: AgentInput, sources: 
   return liveResultSchema.parse({ reply: action.reply, kind: action.kind, candidates, optionIds, reasons: action.options.map((o) => ({ id: resolve(o.id), text: o.reason })), stops, settings: action.settings, schedule, save, visit: action.visit ? { ...action.visit, placeId: resolve(action.visit.placeId), date: localDate(now.toISOString(), input.timezone) } : null, preference: action.preference, event, citations: getSources(action.sourceIds), researched: sources.length > 0, outingDate: action.schedule?.date || action.outingDate });
 }
 
-export async function runAgent(input: AgentInput, key: string, signal: AbortSignal, client = new OpenAI({ apiKey: key, maxRetries: 0, timeout: 55000 })) {
+export async function runAgent(input: AgentInput, key: string, signal: AbortSignal, client = new OpenAI({ apiKey: key, maxRetries: 0, timeout: 55000 }), reportStage: StageReporter = () => {}) {
   const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
   const now = new Date();
   // Validate server-issued evidence before reusing it. Unverified user/backup
@@ -121,16 +161,16 @@ export async function runAgent(input: AgentInput, key: string, signal: AbortSign
   if (availablePlaces(input.state).some((p) => p.sample)) throw new Error("Sample data is not accepted in live mode.");
   const data = { request: input.text, now: now.toISOString(), today: localDate(now.toISOString(), input.timezone), timezone: input.timezone, location: input.location, untrustedContext: input.state };
   const base = { model, store: false as const, reasoning: { effort: "low" as const }, max_output_tokens: 4000 };
-  const intent = await client.responses.parse({ ...base, instructions: system + ` Decide whether current research is needed. New live venue discovery, events, menu prices, open-now or a closer alternative need research. Selecting a candidate, changing time, recording feedback/preferences or saving a user-named place does not need search. Reuse cited evidence younger than 24 hours for follow-ups; stale facts need research. SF Restaurant Week ALWAYS needs official dates from its organizer for a new request. If nearby/closer is requested with no supplied coordinates or manual city/neighborhood, ask for location. Do not assume SF unless requested. Explicit SF Restaurant Week supplies San Francisco. If a necessary date/time is missing, final action can ask. Research query should request primary venue/organizer/park sources, realistic candidates and clear uncertainties.`, input: JSON.stringify(data), text: { format: zodTextFormat(intentSchema, "outing_intent") } }, { signal });
-  const decision = intentSchema.parse(intent.output_parsed);
+  const intent = await providerCall("intent", reportStage, () => client.responses.parse({ ...base, instructions: system + ` Decide whether current research is needed. New live venue discovery, events, menu prices, open-now or a closer alternative need research. Selecting a candidate, changing time, recording feedback/preferences or saving a user-named place does not need search. Reuse cited evidence younger than 24 hours for follow-ups; stale facts need research. SF Restaurant Week ALWAYS needs official dates from its organizer for a new request. If nearby/closer is requested with no supplied coordinates or manual city/neighborhood, ask for location. Do not assume SF unless requested. Explicit SF Restaurant Week supplies San Francisco. If a necessary date/time is missing, final action can ask. Research query should request primary venue/organizer/park sources, realistic candidates and clear uncertainties.`, input: JSON.stringify(data), text: { format: zodTextFormat(intentSchema, "outing_intent") } }, { signal }), true);
+  const decision = parseModelOutput(intentSchema, intent.output_parsed, reportStage, "intent");
   if (decision.question || (decision.locationNeeded && !input.location && !input.state.settings.location)) return liveResultSchema.parse({ reply: decision.question || "Which city or neighborhood should I use? You can also tap Use my location.", kind: "reply", candidates: [], optionIds: [], stops: [], settings: null, schedule: null, save: null, visit: null, preference: null, event: input.state.event, citations: [], researched: false });
   let research = "No new research. Use only supplied personal data or validated recent source evidence.";
   let sources: z.infer<typeof citationSchema>[] = [];
   if (decision.research) {
-    const result = await client.responses.create({ ...base, max_output_tokens: 4500, ...{ max_tool_calls: 3 }, instructions: system + ` Research PRIMARY sources: official event organizers for dates/participation; venue websites for addresses/menus; parks agencies for walks. For SF Restaurant Week verify current announced actual dates at the organizer sfrestaurantweek.com or ggra.org, not generic season assumptions. Distinguish editions and verify menus/participation for those dates. No unsupported popularity/quietness claims. Find up to two main alternatives and one nearby walk if requested. Provide a brief evidence report with citations, event dates and sourced addresses; note missing facts. Never fill missing evidence from memory.`, input: JSON.stringify({ request: decision.researchQuery, location: input.location, manualLocation: input.state.settings.location, now: now.toISOString(), timezone: input.timezone, preferences: input.state.preferences, visitNotes: input.state.visits, plan: input.state.plan }), tools: [{ type: "web_search", search_context_size: "medium", external_web_access: true, user_location: { type: "approximate", ...(input.state.settings.location ? { city: input.state.settings.location } : {}), timezone: input.timezone } }], tool_choice: "required", include: ["web_search_call.action.sources"] }, { signal });
-    if (result.status !== "completed") throw new Error("Research did not complete.");
+    const result = await providerCall("web_search", reportStage, () => client.responses.create({ ...base, max_output_tokens: 4500, ...{ max_tool_calls: 3 }, instructions: system + ` Research PRIMARY sources: official event organizers for dates/participation; venue websites for addresses/menus; parks agencies for walks. For SF Restaurant Week verify current announced actual dates at the organizer sfrestaurantweek.com or ggra.org, not generic season assumptions. Distinguish editions and verify menus/participation for those dates. No unsupported popularity/quietness claims. Find up to two main alternatives and one nearby walk if requested. Provide a brief evidence report with citations, event dates and sourced addresses; note missing facts. Never fill missing evidence from memory.`, input: JSON.stringify({ request: decision.researchQuery, location: input.location, manualLocation: input.state.settings.location, now: now.toISOString(), timezone: input.timezone, preferences: input.state.preferences, visitNotes: input.state.visits, plan: input.state.plan }), tools: [{ type: "web_search", search_context_size: "medium", external_web_access: true, user_location: { type: "approximate", ...(input.state.settings.location ? { city: input.state.settings.location } : {}), timezone: input.timezone } }], tool_choice: "required", include: ["web_search_call.action.sources"] }, { signal }));
+    if (result.status !== "completed") throw new AgentFailure("web_search", "web_search_failed", "web_search_incomplete", "ResponseStatus");
     sources = retrievalSources(result.output);
-    if (!sources.length || result.output.filter((item) => item.type === "web_search_call").length > 3) throw new Error("Invalid retrieval limits/sources.");
+    if (!sources.length || result.output.filter((item) => item.type === "web_search_call").length > 3) throw new AgentFailure("web_search", "web_search_failed", "web_search_sources_invalid", "RetrievalValidation");
     research = result.output_text.slice(0, 18000);
   } else {
     for (const p of availablePlaces(input.state)) if (p.web && verifiedPlace(p, key))
@@ -138,6 +178,9 @@ export async function runAgent(input: AgentInput, key: string, signal: AbortSign
     // Event citations are only reused with a fresh official-date check for new
     // research; simple date/time follow-ups use the existing event range.
   }
-  const response = await client.responses.parse({ ...base, max_output_tokens: 6500, instructions: system + ` Return a structured action. Every discovered place needs nonempty sourceIds referring to the indexed retrieval sources; its ref must be a unique NEW temporary ID. Existing candidate IDs must be copied exactly, ordered as current context.candidateIds for 'second one'. Never include URLs in any generated text: link through sourceIds only. Recommend at most two grounded options. For plan updates keep chosen stop(s), honor 'no extra coffee stop', add a researched walk only when supported. Activity durations are estimates; sum cannot exceed settings.availableTime, travel is extra. New options are research candidates, not silently saved inspiration. Save only explicit user requests, user-provided names/city/reason/budget; visit.note must be an exact substring of current user feedback, no invented numerical rating. General explicit preferences use kind preference. Do not delete or overwrite data. Current plan stays unless kind plan. Preserve existing settings unless user changes them; settings null otherwise. outingDate is a proposed local date when explicitly requested or chosen for an event. Retain context.outingDate on follow-ups. Ask which event day when none has been chosen rather than repeating the same outside-date offer. event is null on simple follow-ups that reuse the existing verified event. schedule is local YYYY-MM-DD and 24h HH:MM; 'six thirty' in an evening context means 18:30 and retains the previously discussed date. If day/meridiem ambiguous ask one question. Confirmed events need fresh confirmation after any time/plan change; never confirm or export automatically. SF Restaurant Week event field must contain the official date range with organizer sourceIds. If requested date or today is outside it, offer event dates OR a normal evening, do not imply ongoing event. eventChoice normal only if user explicitly opts for a normal outing; eventChoice event if explicitly choosing the event. Relevant sourced facts must carry citations; uncertain atmosphere is unknown/suggestion. Candidate facts must come from evidence, not model memory. options/stops are empty unless their kind. save/visit/preference/schedule fields null unless their matching kind. If evidence is inadequate, reply honestly with no filler places.`, input: JSON.stringify({ ...data, untrustedResearch: research, retrievedSources: sources.map((s, id) => ({ id, ...s })) }), text: { format: zodTextFormat(actionSchema, "outing_action") } }, { signal });
-  return validateAction(actionSchema.parse(response.output_parsed), input, sources, key, now);
+  const response = await providerCall("final_action", reportStage, () => client.responses.parse({ ...base, max_output_tokens: 6500, instructions: system + ` Return a structured action. Every discovered place needs nonempty sourceIds referring to the indexed retrieval sources; its ref must be a unique NEW temporary ID. Existing candidate IDs must be copied exactly, ordered as current context.candidateIds for 'second one'. Never include URLs in any generated text: link through sourceIds only. Recommend at most two grounded options. For plan updates keep chosen stop(s), honor 'no extra coffee stop', add a researched walk only when supported. Activity durations are estimates; sum cannot exceed settings.availableTime, travel is extra. New options are research candidates, not silently saved inspiration. Save only explicit user requests, user-provided names/city/reason/budget; visit.note must be an exact substring of current user feedback, no invented numerical rating. General explicit preferences use kind preference. Do not delete or overwrite data. Current plan stays unless kind plan. Preserve existing settings unless user changes them; settings null otherwise. outingDate is a proposed local date when explicitly requested or chosen for an event. Retain context.outingDate on follow-ups. Ask which event day when none has been chosen rather than repeating the same outside-date offer. event is null on simple follow-ups that reuse the existing verified event. schedule is local YYYY-MM-DD and 24h HH:MM; 'six thirty' in an evening context means 18:30 and retains the previously discussed date. If day/meridiem ambiguous ask one question. Confirmed events need fresh confirmation after any time/plan change; never confirm or export automatically. SF Restaurant Week event field must contain the official date range with organizer sourceIds. If requested date or today is outside it, offer event dates OR a normal evening, do not imply ongoing event. eventChoice normal only if user explicitly opts for a normal outing; eventChoice event if explicitly choosing the event. Relevant sourced facts must carry citations; uncertain atmosphere is unknown/suggestion. Candidate facts must come from evidence, not model memory. options/stops are empty unless their kind. save/visit/preference/schedule fields null unless their matching kind. If evidence is inadequate, reply honestly with no filler places.`, input: JSON.stringify({ ...data, untrustedResearch: research, retrievedSources: sources.map((s, id) => ({ id, ...s })) }), text: { format: zodTextFormat(actionSchema, "outing_action") } }, { signal }), true);
+  const action = parseModelOutput(actionSchema, response.output_parsed, reportStage, "action");
+  reportStage("action_validation");
+  try { return validateAction(action, input, sources, key, now); }
+  catch (error) { throw new AgentFailure("action_validation", "action_validation_failed", "action_rejected", error instanceof z.ZodError ? "ZodError" : "Error"); }
 }

@@ -106,29 +106,128 @@ test("SDK follow-up without current facts skips web search, and schemas compile 
 
 test("recommend route bounds requests, rejects sample mode and missing keys honestly", async () => {
   const original = process.env.OPENAI_API_KEY; delete process.env.OPENAI_API_KEY;
+  const originalConsoleError = console.error;
+  const logs: string[] = [];
+  console.error = (line?: unknown) => logs.push(String(line));
   try {
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", body: JSON.stringify(input()) }))).status, 503);
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", body: "bad" }))).status, 400);
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", body: " ".repeat(131073) }))).status, 413);
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { Origin: "https://unrelated.example" }, body: JSON.stringify(input()) }))).status, 403);
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { Host: "127.0.0.1:3001", Origin: "http://127.0.0.1:3001" }, body: JSON.stringify(input()) }))).status, 503);
-    assert.equal((await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { Origin: "null" }, body: JSON.stringify(input()) }))).status, 403);
-  } finally { if (original) process.env.OPENAI_API_KEY = original; }
+    const check = async (request: Request, status: number, code: string) => {
+      const result = await POST(request);
+      const body = await result.json();
+      assert.equal(result.status, status);
+      assert.equal(body.code, code);
+      assert.match(body.requestId, /^[0-9a-f-]{36}$/);
+      return body.requestId as string;
+    };
+    const ids = [
+      await check(new Request("http://localhost/api/recommend", { method: "POST", body: JSON.stringify(input()) }), 503, "provider_not_configured"),
+      await check(new Request("http://localhost/api/recommend", { method: "POST", body: "bad" }), 400, "request_invalid"),
+      await check(new Request("http://localhost/api/recommend", { method: "POST", body: " ".repeat(131073) }), 413, "request_too_large"),
+      await check(new Request("http://localhost/api/recommend", { method: "POST", headers: { Origin: "https://unrelated.example" }, body: JSON.stringify(input()) }), 403, "origin_rejected"),
+      await check(new Request("http://localhost/api/recommend", { method: "POST", headers: { Host: "127.0.0.1:3001", Origin: "http://127.0.0.1:3001" }, body: JSON.stringify(input()) }), 503, "provider_not_configured"),
+      await check(new Request("http://localhost/api/recommend", { method: "POST", headers: { Origin: "null" }, body: JSON.stringify(input()) }), 403, "origin_rejected"),
+    ];
+    assert.equal(logs.length, ids.length);
+    for (const [index, log] of logs.entries()) {
+      const entry = JSON.parse(log);
+      assert.deepEqual(Object.keys(entry).sort(), ["errorClass", "errorCode", "requestId", "stage"]);
+      assert.equal(entry.requestId, ids[index]);
+    }
+  } finally {
+    console.error = originalConsoleError;
+    if (original) process.env.OPENAI_API_KEY = original;
+  }
 });
 
 test("provider failure is sanitized without modifying data or substituting samples", async () => {
   const original = process.env.OPENAI_API_KEY;
   const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
   process.env.OPENAI_API_KEY = key;
   globalThis.fetch = async () => { throw new Error("Mock upstream failure with sensitive data"); };
   try {
     const request = input();
     const before = JSON.stringify(request.state);
-    const response = await POST(new Request("http://localhost/api/recommend", { method: "POST", body: JSON.stringify(request) }));
+    const logs: string[] = [];
+    console.error = (line?: unknown) => logs.push(String(line));
+    const response = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.20" }, body: JSON.stringify(request) }));
     assert.equal(response.status, 502);
-    const text = await response.text();
-    assert.ok(!text.includes("sensitive data") && !text.includes(key));
+    const body = await response.json();
+    assert.equal(body.code, "provider_api_error");
+    assert.match(body.requestId, /^[0-9a-f-]{36}$/);
+    assert.ok(!JSON.stringify(body).includes("sensitive data") && !JSON.stringify(body).includes(key));
+    assert.equal(logs.length, 1);
+    assert.deepEqual(Object.keys(JSON.parse(logs[0])).sort(), ["errorClass", "errorCode", "requestId", "stage"]);
+    assert.equal(JSON.parse(logs[0]).requestId, body.requestId);
+    assert.equal(JSON.parse(logs[0]).stage, "intent");
+    assert.ok(!logs[0].includes("sensitive data") && !logs[0].includes(key));
     assert.equal(JSON.stringify(request.state), before);
+  } finally {
+    console.error = originalConsoleError;
+    globalThis.fetch = originalFetch;
+    if (original) process.env.OPENAI_API_KEY = original; else delete process.env.OPENAI_API_KEY;
+  }
+});
+
+test("malformed Responses output is reported separately from provider errors", async () => {
+  const original = process.env.OPENAI_API_KEY;
+  const originalFetch = globalThis.fetch;
+  process.env.OPENAI_API_KEY = key;
+  globalThis.fetch = async () => response("this is not JSON");
+  try {
+    const result = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.21" }, body: JSON.stringify(input()) }));
+    const body = await result.json();
+    assert.equal(result.status, 502);
+    assert.equal(body.code, "malformed_model_output");
+    assert.match(body.requestId, /^[0-9a-f-]{36}$/);
+    assert.ok(!JSON.stringify(body).includes("this is not JSON"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (original) process.env.OPENAI_API_KEY = original; else delete process.env.OPENAI_API_KEY;
+  }
+});
+
+test("web-search responses without retrieved sources get a web-search category", async () => {
+  const original = process.env.OPENAI_API_KEY;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const logs: string[] = [];
+  process.env.OPENAI_API_KEY = key;
+  let calls = 0;
+  console.error = (line?: unknown) => logs.push(String(line));
+  globalThis.fetch = async () => response(++calls === 1
+    ? { research: true, researchQuery: "Find local primary sources.", locationNeeded: false, question: null }
+    : "No search result was returned.");
+  try {
+    const result = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.23" }, body: JSON.stringify(input()) }));
+    const body = await result.json();
+    assert.equal(result.status, 502);
+    assert.equal(body.code, "web_search_failed");
+    assert.equal(JSON.parse(logs[0]).stage, "web_search");
+    assert.deepEqual(Object.keys(JSON.parse(logs[0])).sort(), ["errorClass", "errorCode", "requestId", "stage"]);
+  } finally {
+    console.error = originalConsoleError;
+    globalThis.fetch = originalFetch;
+    if (original) process.env.OPENAI_API_KEY = original; else delete process.env.OPENAI_API_KEY;
+  }
+});
+
+test("action validation failures are reported separately from malformed model output", async () => {
+  const original = process.env.OPENAI_API_KEY;
+  const originalFetch = globalThis.fetch;
+  process.env.OPENAI_API_KEY = key;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return response(calls === 1
+      ? { research: false, researchQuery: "", locationNeeded: false, question: null }
+      : { ...base(), options: [{ id: "unknown-candidate", reason: "Invalid reference" }] });
+  };
+  try {
+    const result = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.22" }, body: JSON.stringify(input()) }));
+    const body = await result.json();
+    assert.equal(result.status, 502);
+    assert.equal(body.code, "action_validation_failed");
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = originalFetch;
     if (original) process.env.OPENAI_API_KEY = original; else delete process.env.OPENAI_API_KEY;
