@@ -7,6 +7,24 @@ export const httpUrl = z
     (v) => ["http:", "https:"].includes(new URL(v).protocol),
     "Use an http or https URL",
   );
+export const citationSchema = z.object({ url: httpUrl, title: z.string().max(200) });
+export const webSchema = z.object({
+  address: z.string().max(300),
+  facts: z.string().max(1200),
+  uncertainty: z.string().max(600),
+  citations: z.array(citationSchema).min(1).max(6),
+  researchedAt: z.string().datetime(),
+  signature: z.string().max(128),
+});
+export const eventSchema = z.object({
+  name: z.string().max(120),
+  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  citations: z.array(citationSchema).min(1).max(6),
+  normalEvening: z.boolean(),
+  signature: z.string().max(128).optional(),
+  verifiedAt: z.string().datetime().optional(),
+});
 export const placeSchema = z.object({
   id: z.string().min(1),
   name: z.string().trim().min(1).max(120),
@@ -20,6 +38,7 @@ export const placeSchema = z.object({
   placeId: z.string().min(1).max(300).optional(),
   createdAt: z.string().datetime(),
   sample: z.boolean().optional(),
+  web: webSchema.optional(),
 });
 export const visitSchema = z.object({
   id: z.string(),
@@ -51,6 +70,8 @@ export const messageSchema = z.object({
     .default("text"),
   candidateIds: z.array(z.string()).max(3).optional(),
   savedPlaceId: z.string().optional(),
+  citations: z.array(citationSchema).max(12).optional(),
+  reasons: z.array(z.object({ id: z.string(), text: z.string().max(600) })).max(2).optional(),
 });
 export const scheduleSchema = z.object({
   start: z.string().datetime(),
@@ -75,6 +96,7 @@ export const contextSchema = z.object({
   pendingQuery: z.string().max(2000).optional(),
   pendingSave: z.string().max(4000).optional(),
   pendingSchedule: z.string().max(2000).optional(),
+  outingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 export const stateSchema = z.object({
   version: z.literal(1),
@@ -85,6 +107,9 @@ export const stateSchema = z.object({
   messages: z.array(messageSchema).max(100).default([]),
   context: contextSchema.default({ candidateIds: [] }),
   schedule: scheduleSchema.nullable().default(null),
+  research: z.array(placeSchema).max(12).default([]),
+  preferences: z.array(z.string().max(300)).max(30).default([]),
+  event: eventSchema.nullable().default(null),
 });
 export type SavedPlace = z.infer<typeof placeSchema>;
 export type Visit = z.infer<typeof visitSchema>;
@@ -108,7 +133,11 @@ export const emptyState = (): State => ({
   messages: [],
   context: { candidateIds: [] },
   schedule: null,
+  research: [],
+  preferences: [],
+  event: null,
 });
+export const availablePlaces = (state: State) => [...state.places, ...state.research.filter((p) => !state.places.some((saved) => saved.id === p.id))];
 export const normalized = (v: string) =>
   v
     .trim()
@@ -125,10 +154,10 @@ export function duplicateOf(places: SavedPlace[], place: SavedPlace) {
 }
 export function mapsUrl(place: SavedPlace, origin = "") {
   if (!place.placeId)
-    return `https://www.google.com/maps/search/?${new URLSearchParams({ api: "1", query: `${place.name}, ${place.city}` })}`;
+    return `https://www.google.com/maps/search/?${new URLSearchParams({ api: "1", query: `${place.name}, ${place.web?.address || place.city}` })}`;
   const params = new URLSearchParams({
     api: "1",
-    destination: `${place.name}, ${place.city}`,
+    destination: `${place.name}, ${place.web?.address || place.city}`,
     destination_place_id: place.placeId,
   });
   if (origin.trim()) params.set("origin", origin.trim());

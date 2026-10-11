@@ -12,8 +12,7 @@ export default function Terms() {
       </p>
       <p>
         Your saved links and notes are your responsibility. Recommendations
-        match your own saved data and do not verify availability, menus, prices,
-        or reservations.
+        use personal data and optionally sourced web research. Sources may be incomplete or stale; confirm dates, menus, costs, noise, and availability with the venue. No reservation or popularity guarantee is made. Calendar export requires your confirmation and never syncs automatically.
       </p>
       <h2>Google services</h2>
       <p>

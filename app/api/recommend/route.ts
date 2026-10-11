@@ -1,0 +1,41 @@
+import { NextResponse } from "next/server";
+import { agentInputSchema, runAgent } from "@/lib/agent";
+export const runtime = "nodejs";
+export const maxDuration = 60;
+const counts = new Map<string, { count: number; expires: number }>();
+const json = (data: unknown, status = 200) => NextResponse.json(data, { status, headers: { "Cache-Control": "no-store" } });
+export async function POST(request: Request) {
+  const origin = request.headers.get("origin");
+  if (origin) {
+    try {
+      // Next's internal URL can use localhost behind a proxy even when the
+      // browser uses a LAN address. Compare the actual HTTP host instead.
+      const url = new URL(origin);
+      if (!["http:", "https:"].includes(url.protocol) || url.host !== (request.headers.get("host") || new URL(request.url).host)) return json({ error: "Use Pinny from its own site." }, 403);
+    } catch { return json({ error: "Use Pinny from its own site." }, 403); }
+  }
+  if (Number(request.headers.get("content-length") || 0) > 131072) return json({ error: "Context is too large." }, 413);
+  let parsed;
+  try {
+    const body = await request.text();
+    if (new TextEncoder().encode(body).length > 131072) return json({ error: "Context is too large." }, 413);
+    parsed = agentInputSchema.safeParse(JSON.parse(body));
+  } catch { return json({ error: "Send a valid Pinny request." }, 400); }
+  if (!parsed.success) return json({ error: "The conversation context is invalid or too large. Your data has been kept." }, 400);
+  if ([...parsed.data.state.places, ...parsed.data.state.research].some((p) => p.sample)) return json({ error: "Sample places cannot be sent to live research." }, 400);
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return json({ error: "Live AI is not configured. Add OPENAI_API_KEY on the server, or explicitly choose saved-only mode or the sample demo.", code: "not_configured" }, 503);
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0] || "local";
+  const now = Date.now();
+  for (const [id, entry] of counts) if (entry.expires < now) counts.delete(id);
+  const counter = counts.get(ip) || { count: 0, expires: now + 60000 };
+  if (counter.count >= 5 || counts.size >= 1000) return json({ error: "Please wait a minute before another AI request." }, 429);
+  counter.count++; counts.set(ip, counter);
+  try {
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(55000)]);
+    return json(await runAgent(parsed.data, key, signal));
+  } catch {
+    // Never log prompts, credentials, precise location, or upstream response bodies.
+    return json({ error: "Live AI/research could not complete within its limits or returned an invalid action. No plan or personal data was changed. Retry, choose saved-only mode, or switch to the sample demo.", code: "provider_error" }, 502);
+  }
+}

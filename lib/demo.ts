@@ -98,4 +98,7 @@ export const demoState = (): State => ({
   messages: [],
   context: { candidateIds: [] },
   schedule: null,
+  research: [],
+  preferences: [],
+  event: null,
 });

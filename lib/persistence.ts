@@ -1,4 +1,4 @@
-import { Mode, State, emptyState, stateSchema } from "./model";
+import { Mode, State, emptyState, stateSchema, availablePlaces } from "./model";
 import { demoState } from "./demo";
 export interface StorageLike {
   getItem(key: string): string | null;
@@ -52,7 +52,7 @@ export function loadState(storage: StorageLike, mode: Mode): LoadResult {
         writable: false,
       };
     const state = parsed.data;
-    const ids = new Set(state.places.map((p) => p.id));
+    const ids = new Set(availablePlaces(state).map((p) => p.id));
     state.plan = state.plan.filter((s) => ids.has(s.savedPlaceId));
     // Preserve personal history even if a legacy record references a missing place.
     state.context.candidateIds = state.context.candidateIds.filter((id) =>

@@ -4,7 +4,7 @@ import { newId } from "./conversation";
 
 export const MAX_BACKUP_BYTES = 2 * 1024 * 1024;
 const dataSchema = stateSchema.pick({
-  places: true, visits: true, plan: true, settings: true, schedule: true,
+  places: true, visits: true, plan: true, settings: true, schedule: true, preferences: true,
 });
 const backupSchema = z.object({
   format: z.literal("pinny-personal-backup"),
@@ -80,6 +80,7 @@ export function mergeBackup(current: State, backup: PersonalBackup): State {
     next.context.selectedId = next.plan[0].savedPlaceId;
   }
   if (wasEmpty) next.settings = incoming.settings;
+  next.preferences = [...new Set([...next.preferences, ...incoming.preferences])];
   const validated = stateSchema.safeParse(next);
   if (!validated.success)
     throw new Error("The combined data exceeds Pinny's storage limits. Nothing was imported.");

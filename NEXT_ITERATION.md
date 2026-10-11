@@ -1,6 +1,6 @@
 # Next iteration goals — deferred from the published baseline
 
-These are recorded goals, not implemented capabilities or a commitment to add them in this deployment task.
+These goals are preserved from the published baseline. This iteration adds a server-side live AI/web path and an action-only current-location control without rebuilding the app. Live provider verification is still pending because no OpenAI key was available; see README and LIVE_CHECKLIST.md.
 
 - Minimal voice-led interaction without mandatory forms.
 - Real AI conversation with contextual follow-ups.
@@ -11,4 +11,4 @@ These are recorded goals, not implemented capabilities or a commitment to add th
 - Personalization from actual saved inspiration and visit experiences.
 - User-triggered social-save import; investigate a browser extension first.
 
-The baseline remains a clearly labeled keyless sample experience plus a personal workspace, with deterministic language parsing, Google Maps links, confirmed `.ics` export, and local personal notes. JSON backup transfer is only for Pinny's own data.
+The keyless sample and explicitly selected saved-only experiences keep deterministic parsing. Personal/live mode now has bounded OpenAI interpretation, optional official web search, cited research cards, contextual plan/time actions, and stored personal preferences/visit feedback. Google Maps links, confirmed `.ics` export, existing browser data, and Pinny-only JSON transfer remain supported. Swipe UI, social extensions/import, account sync, background detection and automatic booking stay deferred.

@@ -6,10 +6,12 @@ export default function Privacy() {
       <h1>Privacy policy</h1>
       <p>
         Pinny is a hackathon prototype. Your places, links, notes, personal
-        visits, settings, and plan stay in your browser’s local storage. Demo
+        visits, preferences, research citations, settings, and plan are saved in your browser’s local storage. Demo
         and personal workspaces are separate. There is no account or database.
         Clearing browser data removes these records.
       </p>
+      <h2>Live AI and web research</h2>
+      <p>In the personal live workspace, sending a request shares bounded conversation, relevant saved place notes, preferences, visit feedback, and plan context through our server with OpenAI. Current facts may use OpenAI web search. Notes and links are treated as untrusted data, not instructions. We request API responses with storage disabled; OpenAI’s own data policies still apply. Sample and explicitly selected saved-only mode do not call AI. Source summaries and citations can be saved locally; no raw web pages are stored.</p>
       <h2>Optional Google Places</h2>
       <p>
         Only when you choose “Find Google match,” the name and city you enter
@@ -30,14 +32,13 @@ export default function Privacy() {
         Microphone and location access start only when you press the
         corresponding button. Voice recognition may use your browser vendor’s
         speech service. Pinny does not save raw audio or current coordinates.
-        Location stays in memory for the current tab. Type a city or
-        neighborhood at any time.
+        Precise location stays in memory for the current tab for Maps. Nearby or closer live requests send an approximate position rounded to about 100 meters to our server and OpenAI. Location is never placed in localStorage or JSON backups. Type a city or neighborhood instead or clear the current area at any time.
       </p>
       <h2>External websites</h2>
       <p>
         Maps and inspiration links open external websites with their own
         policies. Pinny does not scrape, download, or read your source posts. No
-        AI service is used in this version.
+        source-post extraction is performed. Live requests can research public primary sources.
       </p>
       <p>
         Last updated October 11, 2026. Deployment operators should provide their

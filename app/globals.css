@@ -2201,3 +2201,18 @@ h3 {
 .sidebar-quote span {
   color: #6b745f;
 }
+
+.location-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 0 4px 9px; }
+.location-actions button { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: #626b56; }
+.location-status { font-size: 10px; line-height: 1.5; color: #626b56; margin: 0 4px 8px; max-height: 45px; overflow: auto; }
+.live-error { border: 1px solid #d7aa97; background: #fbede5; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; font-size: 11px; max-height: 130px; overflow: auto; }
+.live-error p { line-height: 1.6; margin-bottom: 6px; }
+.live-error .quiet { color: #974331; font-size: 11px; margin-right: 13px; }
+.web-evidence { padding: 12px 0; border-bottom: 1px solid #e5e3d6; margin-bottom: 10px; }
+.web-evidence p { font-size: 12px; line-height: 1.6; margin-top: 7px; overflow-wrap: anywhere; }
+.web-evidence .fine-print { font-size: 10px; }
+.sources a { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.live-citations { margin: 8px 0 15px; }
+.plan-stop .sources { margin-top: 7px; }
+.dialog-heading { position: sticky; top: -27px; z-index: 2; background: #fffef8; padding: 12px 0; }
+@media (max-width: 640px) { .dialog-heading { top: -23px; } .location-actions button { font-size: 10px; } .composer textarea { font-size: 16px; } .main-workspace { min-height: 0; } }

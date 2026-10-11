@@ -36,6 +36,7 @@ import {
   mapsUrl,
   directionsUrl,
   httpUrl,
+  availablePlaces,
 } from "@/lib/model";
 import {
   loadState,
@@ -45,6 +46,7 @@ import {
 } from "@/lib/persistence";
 import { demoState } from "@/lib/demo";
 import { converse } from "@/lib/conversation";
+import { applyLiveResult } from "@/lib/live";
 import { kind } from "@/lib/recommend";
 import { calendarFile, scheduleLabel } from "@/lib/calendar";
 import { speechConstructor, SpeechRecognizer } from "@/lib/voice";
@@ -87,6 +89,11 @@ export default function Pinny() {
   const [undo, setUndo] = useState<State | null>(null);
   const [notice, setNotice] = useState("");
   const [google, setGoogle] = useState(false);
+  const [aiConfigured, setAiConfigured] = useState(false);
+  const [personalEngine, setPersonalEngine] = useState<"live" | "saved">("live");
+  const [liveError, setLiveError] = useState("");
+  const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number; accuracy: number } | null>(null);
+  const agentRequest = useRef<AbortController | null>(null);
   const [googleSearch, setGoogleSearch] = useState<{
     id: string;
     loading: boolean;
@@ -117,6 +124,7 @@ export default function Pinny() {
       let initialMode: Mode = "demo";
       try {
         if (localStorage.getItem("pinny:mode") === "live") initialMode = "live";
+        if (localStorage.getItem("pinny:engine") === "saved") setPersonalEngine("saved");
       } catch {}
       const result = loadState(browserStorage(), initialMode);
       setMode(initialMode);
@@ -133,13 +141,14 @@ export default function Pinny() {
     fetch("/api/capabilities")
       .then((r) => r.json())
       .then((data) => {
-        if (!canceled) setGoogle(data.googlePlaces === true);
+        if (!canceled) { setGoogle(data.googlePlaces === true); setAiConfigured(data.ai === true); }
       })
       .catch(() => {});
     return () => {
       canceled = true;
       recognition.current?.abort();
       placesRequest.current?.abort();
+      agentRequest.current?.abort();
       if (submitTimer.current) clearTimeout(submitTimer.current);
     };
   }, []);
@@ -203,6 +212,7 @@ export default function Pinny() {
   }
   function switchMode() {
     recognition.current?.abort();
+    agentRequest.current?.abort();
     placesRequest.current?.abort();
     if (submitTimer.current) clearTimeout(submitTimer.current);
     setProcessing(false);
@@ -220,6 +230,8 @@ export default function Pinny() {
     setUndo(null);
     setInput("");
     setOrigin("");
+    setCurrentLocation(null);
+    setLiveError("");
     setLocationStatus("");
     setNotice("");
     conflict.current = false;
@@ -237,13 +249,42 @@ export default function Pinny() {
       );
     }
   }
-  function submit(text = input) {
+  async function submit(text = input) {
     if (!ready || processing || !text.trim() || crossTab) return;
     recognition.current?.stop();
     setVoiceMessage("");
     setInput("");
     setProcessing(true);
     setNotice("");
+    setLiveError("");
+    if (mode === "live" && personalEngine === "live" && !(/^confirm(?: this time)?[.!]?$/i.test(text.trim()) && latest.current.state.schedule)) {
+      const snapshot = latest.current.state;
+      const controller = new AbortController();
+      agentRequest.current = controller;
+      try {
+        const important = new Set([...snapshot.plan.map((s) => s.savedPlaceId), ...snapshot.context.candidateIds, snapshot.context.selectedId]);
+        const words = text.toLowerCase().split(/\W+/).filter((w) => w.length > 3);
+        const ranked = [...snapshot.places].sort((a,b) => {
+          const score = (p: SavedPlace) => (important.has(p.id) ? 1000 : 0) + words.filter((w) => `${p.name} ${p.whySaved} ${p.tags.join(" ")}`.toLowerCase().includes(w)).length;
+          return score(b)-score(a);
+        });
+        const bounded = { ...snapshot, places: ranked.slice(0, 40).map((p) => ({ ...p, whySaved: p.whySaved.slice(0,600) })), visits: snapshot.visits.slice(-40).map((v) => ({ ...v, note: v.note.slice(0,600) })), messages: snapshot.messages.slice(-16).map((m) => ({ ...m, text: m.text.slice(0,1200) })) };
+        const locationNeeded = /nearby|closer|near me|here|around me|walking distance/i.test(text);
+        const response = await fetch("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, state: bounded, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, location: locationNeeded ? currentLocation : null }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(58000)]) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Live research failed. Your data was kept.");
+        if (latest.current.state !== snapshot || latest.current.mode !== "live" || conflict.current) throw new Error("Your workspace changed during this request. Retry using the current data.");
+        commit(applyLiveResult(snapshot, text, data));
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setLiveError(error instanceof Error ? error.message : "Live AI is unavailable. Your data was kept.");
+          setInput((current) => current || text);
+        }
+      } finally {
+        if (agentRequest.current === controller) { setProcessing(false); inputRef.current?.focus(); }
+      }
+      return;
+    }
     submitTimer.current = setTimeout(() => {
       const next = converse(latest.current.state, text);
       if (latest.current.mode === "demo")
@@ -486,15 +527,16 @@ export default function Pinny() {
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setOrigin(`${position.coords.latitude},${position.coords.longitude}`);
+        setCurrentLocation({ latitude: Math.round(position.coords.latitude * 1000)/1000, longitude: Math.round(position.coords.longitude * 1000)/1000, accuracy: Math.max(100, position.coords.accuracy) });
         setLocationStatus(
-          "Current location will be used as your Maps starting point for this tab only. Tell Pinny your city to match inspiration.",
+          "Current area is active for this tab. Nearby/closer requests share an approximate position with live AI. Precise coordinates are not saved. You can use a typed city instead.",
         );
       },
       (error) => {
         setLocationStatus(
           error.code === 1
             ? "Location permission denied. Tell Pinny your city; everything still works."
-            : "Couldn’t get your location. Tell Pinny your city instead.",
+            : error.code === 3 ? "Location timed out. Try again or type your city/neighborhood." : "Location is unavailable. Type your city/neighborhood instead.",
         );
       },
       { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 },
@@ -503,13 +545,13 @@ export default function Pinny() {
   const planPlaces = state.plan
     .map((s) => ({
       stop: s,
-      place: state.places.find((p) => p.id === s.savedPlaceId),
+      place: availablePlaces(state).find((p) => p.id === s.savedPlaceId),
     }))
     .filter(
       (p): p is { stop: State["plan"][number]; place: SavedPlace } => !!p.place,
     );
   const total = state.plan.reduce((sum, s) => sum + s.duration, 0);
-  const activePlace = state.places.find(
+  const activePlace = availablePlaces(state).find(
     (p) => p.id === state.context.selectedId,
   );
   const activeExperience = activePlace
@@ -526,6 +568,7 @@ export default function Pinny() {
               <span>
                 {place.neighborhood || place.city} · ~{stop.duration} min
               </span>
+              {place.web && <div className="sources">{place.web.citations.slice(0,2).map((s) => <a href={s.url} key={s.url} target="_blank" rel="noopener noreferrer">{s.title}<ExternalLink size={10} /></a>)}</div>}
             </div>
             <a
               href={directionsUrl(place, origin || state.settings.location)}
@@ -558,7 +601,7 @@ export default function Pinny() {
       </div>
     );
   }
-  function renderOptionCard(place: SavedPlace, index: number) {
+  function renderOptionCard(place: SavedPlace, index: number, reason?: string) {
     const experience = state.visits
       .filter((v) => v.savedPlaceId === place.id)
       .at(-1);
@@ -575,6 +618,8 @@ export default function Pinny() {
             <span>· {place.neighborhood || place.city}</span>
           </div>
           <h3>{place.name}</h3>
+          {reason && <p className="place-note">{reason}</p>}
+          {place.web && <div className="web-evidence"><span className="eyebrow">Web sourced · Maps lookup</span><p>{place.web.facts}</p>{place.web.address && <p>{place.web.address}</p>}<p className="fine-print">{place.web.uncertainty}</p><p className="fine-print">Researched {new Date(place.web.researchedAt).toLocaleDateString("en-US")}. Recheck current details.</p><div className="sources">{place.web.citations.map((s) => <a key={s.url} href={s.url} target="_blank" rel="noopener noreferrer">{s.title}<ExternalLink size={10} /></a>)}</div></div>}
           <p className="place-note">
             {place.whySaved || "Saved in your personal inspiration."}
           </p>
@@ -635,17 +680,18 @@ export default function Pinny() {
           )}
         </div>
         <p>{message.text}</p>
+        {message.citations?.length ? <div className="sources live-citations" aria-label="Retrieved sources">{message.citations.map((s) => <a key={s.url} href={s.url} target="_blank" rel="noopener noreferrer">{s.title}<ExternalLink size={10} /></a>)}</div> : null}
         {message.kind === "options" && (
           <div className="option-grid">
             {message.candidateIds?.map((id, index) => {
-              const p = state.places.find((p) => p.id === id);
+              const p = availablePlaces(state).find((p) => p.id === id);
               return p ? (
                 <div key={id} className="option-container">
-                  {renderOptionCard(p, index)}
+                  {renderOptionCard(p, index, message.reasons?.find((r) => r.id === id)?.text)}
                 </div>
               ) : (
                 <p key={id} className="fine-print">
-                  This saved place was removed.
+                  This suggestion is no longer in the current context. Ask Pinny to refresh it.
                 </p>
               );
             })}
@@ -773,8 +819,8 @@ export default function Pinny() {
             onClick={() => setSettingsOpen(true)}
             aria-label="Workspace settings and mode"
           >
-            {mode === "demo" ? "Sample demo" : "Saved inspiration"}
-            <span>·</span>No AI
+            {mode === "demo" ? "Sample demo" : personalEngine === "saved" ? "Saved only" : "Live workspace"}
+            <span>·</span>{mode === "demo" || personalEngine === "saved" ? "No AI" : aiConfigured ? "AI configured" : "AI needs key"}
           </button>
         </header>
         {(storageWarning || crossTab) && (
@@ -950,8 +996,8 @@ export default function Pinny() {
             aria-label="Current interpreted context"
           >
             <MapPin size={12} />
-            <button onClick={() => draft("Find something in ")}>
-              {state.settings.location || "City not set"}
+            <button onClick={() => { setCurrentLocation(null); setOrigin(""); draft("Find something in "); }} title="Edit location; clears current coordinates">
+              {currentLocation ? "Current area · edit" : state.settings.location || "City not set"}
             </button>
             <span>·</span>
             <button onClick={() => draft("My budget is ")}>
@@ -974,6 +1020,9 @@ export default function Pinny() {
               {state.settings.availableTime} min of activities
             </button>
           </div>
+          <div className="location-actions"><button type="button" className="quiet" onClick={locate} disabled={processing || locationStatus === "Requesting location…"}><MapPin size={14} /> Use my location</button>{currentLocation && <button className="quiet" onClick={() => { setCurrentLocation(null); setOrigin(""); setLocationStatus("Current location cleared. Type a city or neighborhood."); }}>Clear current area</button>}</div>
+          {locationStatus && <p className="location-status" role="status">{locationStatus}</p>}
+          {liveError && <div className="live-error" role="alert"><p>{liveError}</p><button className="quiet" onClick={() => submit(input)}>Retry live</button><button className="quiet" onClick={() => { setPersonalEngine("saved"); try { localStorage.setItem("pinny:engine","saved"); } catch {} setLiveError(""); }}>Use saved-only mode</button><button className="quiet" onClick={switchMode}>Switch to sample demo</button></div>}
           <form
             className={`composer ${voice === "listening" ? "composer-listening" : ""}`}
             onSubmit={(event) => {
@@ -1020,7 +1069,7 @@ export default function Pinny() {
                   submit();
                 }
               }}
-              disabled={!ready || processing}
+              disabled={!ready}
             />
             <button
               type="submit"
@@ -1048,8 +1097,7 @@ export default function Pinny() {
             </span>
           </div>
           <p className="honesty-caption">
-            Matches your saved notes. Limited language parsing. No verified
-            prices, hours, or reservations.
+            {mode === "live" && personalEngine === "live" ? "Live AI uses your supplied notes and retrieved sources. Noise and availability may be unknown. Confirm times before calendar export." : "Matches your saved notes. Limited language parsing. No verified prices, hours, or reservations."}
           </p>
         </div>
       </main>
@@ -1253,10 +1301,9 @@ export default function Pinny() {
               <ArrowUpRight size={14} />
             </button>
             <p>
-              Pinny uses your own saved notes and budget estimates. No AI is
-              connected. Language understanding is limited to supported outing
-              phrases and follow-ups.
+              {mode === "demo" ? "The sample demo stays keyless with limited language parsing. Sample references are never mixed into live research." : "Live AI uses bounded conversation, saved inspiration, preferences, and visit notes. Current facts need sourced research. Your Google capability is independent."}
             </p>
+            {mode === "live" && <><div className="setting-row"><span><strong>Live conversation and web research</strong><small>{aiConfigured ? "OpenAI configured; not a provider health check" : "OPENAI_API_KEY missing on this server"}</small></span><span className="provider-status">{aiConfigured ? "Configured" : "Off"}</span></div><button className="secondary" onClick={() => { const next = personalEngine === "live" ? "saved" : "live"; setPersonalEngine(next); try { localStorage.setItem("pinny:engine",next); } catch {} closeDialog(); }}>Use {personalEngine === "live" ? "saved-only mode" : "live AI"}</button>{state.preferences.length > 0 && <p className="fine-print">Personal preferences: {state.preferences.join(" · ")}</p>}</>}
             <div className="setting-row">
               <span>
                 <strong>Google place matching</strong>
@@ -1284,7 +1331,7 @@ export default function Pinny() {
               <span className="provider-status">Local</span>
             </div>
             <button className="secondary" onClick={locate}>
-              <MapPin size={15} /> Use my location for Maps
+              <MapPin size={15} /> Use my location
             </button>
             {locationStatus && (
               <p className="fine-print" role="status">
@@ -1292,8 +1339,7 @@ export default function Pinny() {
               </p>
             )}
             <p className="fine-print">
-              Your raw location is never saved. It only supplies a Maps starting
-              point; recommendations use the city you tell Pinny.
+              Precise location stays in tab memory for Maps. Nearby/closer live requests send an approximate position to the server and OpenAI. Type a city/neighborhood instead at any time.
             </p>
             {mode === "live" && (
               <div className="data-transfer">
