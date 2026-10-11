@@ -186,7 +186,7 @@ test("malformed Responses output is reported separately from provider errors", a
   }
 });
 
-test("web-search responses without retrieved sources get a web-search category", async () => {
+test("empty web-search citations return a transparent no-source response instead of failing", async () => {
   const original = process.env.OPENAI_API_KEY;
   const originalFetch = globalThis.fetch;
   const originalConsoleError = console.error;
@@ -200,15 +200,35 @@ test("web-search responses without retrieved sources get a web-search category",
   try {
     const result = await POST(new Request("http://localhost/api/recommend", { method: "POST", headers: { "x-forwarded-for": "198.51.100.23" }, body: JSON.stringify(input()) }));
     const body = await result.json();
-    assert.equal(result.status, 502);
-    assert.equal(body.code, "web_search_failed");
-    assert.equal(JSON.parse(logs[0]).stage, "web_search");
-    assert.deepEqual(Object.keys(JSON.parse(logs[0])).sort(), ["errorClass", "errorCode", "requestId", "stage"]);
+    assert.equal(result.status, 200);
+    assert.equal(body.researched, true);
+    assert.equal(body.candidates.length, 0);
+    assert.match(body.reply, /couldn’t verify current local sources/i);
+    assert.deepEqual(logs, []);
+    assert.equal(calls, 2);
   } finally {
     console.error = originalConsoleError;
     globalThis.fetch = originalFetch;
     if (original) process.env.OPENAI_API_KEY = original; else delete process.env.OPENAI_API_KEY;
   }
+});
+
+test("a typed neighborhood answer is retained and satisfies a location follow-up", async () => {
+  const request = input();
+  request.text = "north beach";
+  request.state.messages = [{ id: "ask", role: "assistant", text: "Which city or neighborhood should I look in?", kind: "text" }];
+  const bodies: Record<string, unknown>[] = [];
+  const client = new OpenAI({ apiKey: key, maxRetries: 0, fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    bodies.push(body);
+    return response(bodies.length === 1
+      ? { research: false, researchQuery: "", locationNeeded: true, question: "Which city or neighborhood should I look in?" }
+      : base());
+  } });
+  const result = await runAgent(request, key, AbortSignal.timeout(5000), client);
+  assert.equal(bodies.length, 2);
+  assert.match(JSON.stringify(bodies[0].input), /north beach/i);
+  assert.equal(result.settings?.location, "north beach");
 });
 
 test("action validation failures are reported separately from malformed model output", async () => {
