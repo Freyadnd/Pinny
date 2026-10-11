@@ -249,6 +249,12 @@ export default function Pinny() {
       );
     }
   }
+  function activateLiveAi() {
+    if (mode === "demo") switchMode();
+    setPersonalEngine("live");
+    try { localStorage.setItem("pinny:engine", "live"); } catch {}
+    closeDialog();
+  }
   async function submit(text = input) {
     if (!ready || processing || !text.trim() || crossTab) return;
     recognition.current?.stop();
@@ -815,12 +821,12 @@ export default function Pinny() {
             Your personal outing companion
           </div>
           <button
-            className="capability-badge"
-            onClick={() => setSettingsOpen(true)}
-            aria-label="Workspace settings and mode"
+            className={`capability-badge${mode === "demo" ? " live-entry" : ""}`}
+            onClick={mode === "demo" ? activateLiveAi : () => setSettingsOpen(true)}
+            aria-label={mode === "demo" ? "Use live AI" : "Workspace settings and mode"}
           >
-            {mode === "demo" ? "Sample demo" : personalEngine === "saved" ? "Saved only" : "Live workspace"}
-            <span>·</span>{mode === "demo" || personalEngine === "saved" ? "No AI" : aiConfigured ? "AI configured" : "AI needs key"}
+            {mode === "demo" ? "Use live AI" : personalEngine === "saved" ? "Saved only" : "Live workspace"}
+            <span>·</span>{mode === "demo" ? aiConfigured ? "Configured" : "Check setup" : personalEngine === "saved" ? "No AI" : aiConfigured ? "AI configured" : "AI needs key"}
           </button>
         </header>
         {(storageWarning || crossTab) && (

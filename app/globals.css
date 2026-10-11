@@ -305,6 +305,17 @@ h3 {
 .capability-badge span {
   color: #a4a28f;
 }
+.capability-badge.live-entry {
+  background: var(--coral);
+  border-color: var(--coral);
+  color: white;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 9px 13px;
+}
+.capability-badge.live-entry span {
+  color: rgb(255 255 255 / 72%);
+}
 .conversation-scroll {
   overflow-y: auto;
   overscroll-behavior: contain;
